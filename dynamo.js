@@ -28,7 +28,7 @@ const USER_SK = process.env.USER_SK || 'USER';
 
 // S3
 const ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || '342448511865';
-const BUCKET_NAME = process.env.S3_BUCKET || 'secure-buckett';
+const BUCKET_NAME = process.env.S3_BUCKET || 'secure-buckett'
 const S3_REGION = process.env.S3_REGION || 'us-east-1';
 
 // CORS allowlist (normalize: trim trailing slashes & lowercase)
