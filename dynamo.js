@@ -17,8 +17,8 @@ import {
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
-/** ====== ENV / DEFAULTS ====== */
-const PORT = process.env.PORT || 8000;
+/* ========= ENV / DEFAULTS ========= */
+const PORT = Number(process.env.PORT) || 8080;
 
 // Auth / DDB
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
@@ -31,27 +31,35 @@ const ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || '342448511865';
 const BUCKET_NAME = process.env.S3_BUCKET || 'secure-buckett';
 const S3_REGION = process.env.S3_REGION || 'us-east-1';
 
-// CORS (multiple local origins allowed)
-const CORS_ORIGINS =
-  (process.env.CORS_ORIGINS &&
-    process.env.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)) ||
-  ['http://localhost:3000', 'http://192.168.56.1:3000'];
+// CORS allowlist (normalize: trim trailing slashes & lowercase)
+const RAW_ORIGINS = (process.env.CORS_ORIGINS && process.env.CORS_ORIGINS.split(','))
+  || ['http://localhost:3000', 'http://192.168.56.1:3000', 'https://d1e7o1ng62c5j.cloudfront.net'];
 
-/** ====== AWS CLIENTS ====== */
+const ALLOW_SET = new Set(
+  RAW_ORIGINS
+    .map(s => (s || '').trim())
+    .filter(Boolean)
+    .map(o => o.replace(/\/+$/, '').toLowerCase())
+);
+
+/* ========= AWS CLIENTS ========= */
 const ddbClient = new DynamoDBClient({ region: AWS_REGION });
 const ddb = DynamoDBDocumentClient.from(ddbClient, {
   marshallOptions: { convertEmptyValues: true, removeUndefinedValues: true, convertClassInstanceToMap: true },
 });
 const s3 = new S3Client({ region: S3_REGION });
 
-/** ====== APP ====== */
+/* ========= APP ========= */
 const app = express();
+
 const corsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (CORS_ORIGINS.includes(origin)) return cb(null, true);
-    cb(new Error(`CORS blocked for origin: ${origin}`), false);
+    if (!origin) return cb(null, true); // allow curl/postman or server-to-server
+    const norm = origin.replace(/\/+$/, '').toLowerCase();
+    if (ALLOW_SET.has(norm)) return cb(null, true);
+    return cb(new Error(`CORS blocked for origin: ${origin}`), false);
   },
+  credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 };
@@ -59,11 +67,10 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json());
 
-/** ====== HELPERS ====== */
+/* ========= HELPERS ========= */
 const signToken = (payload) => jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
 const nowIso = () => new Date().toISOString();
-const sanitize = (name) => name.replace(/[^\w.\- ]+/g, '_');
-
+const sanitize = (name) => String(name || '').replace(/[^\w.\- ]+/g, '_');
 function authRequired(req, res, next) {
   const hdr = req.headers['authorization'];
   if (!hdr?.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing bearer token' });
@@ -71,12 +78,12 @@ function authRequired(req, res, next) {
     req.user = jwt.verify(hdr.slice(7), JWT_SECRET);
     next();
   } catch {
-    res.status(401).json({ error: 'Invalid token' });
+    return res.status(401).json({ error: 'Invalid token' });
   }
 }
 const userPrefix = (req) => `users/${(req.user?.email || 'anon').toLowerCase()}/`;
 
-/** ====== HEALTH ====== */
+/* ========= HEALTH ========= */
 app.get('/health', async (_req, res) => {
   try {
     await s3.send(new HeadBucketCommand({ Bucket: BUCKET_NAME }));
@@ -86,7 +93,7 @@ app.get('/health', async (_req, res) => {
   }
 });
 
-/** ====== AUTH (DynamoDB) ====== */
+/* ========= AUTH (DynamoDB) ========= */
 app.post('/signup', async (req, res) => {
   try {
     const name = (req.body?.name || '').trim();
@@ -105,7 +112,9 @@ app.post('/signup', async (req, res) => {
     const token = signToken({ sub: email, email, src: 'dynamo' });
     res.json({ message: 'Signup success', accessToken: token, user: { email, name } });
   } catch (err) {
-    if (err?.name === 'ConditionalCheckFailedException') return res.status(409).json({ error: 'User already exists' });
+    if (err?.name === 'ConditionalCheckFailedException') {
+      return res.status(409).json({ error: 'User already exists' });
+    }
     console.error('Signup error:', err);
     res.status(500).json({ error: 'Failed to sign up' });
   }
@@ -131,9 +140,9 @@ app.post('/login', async (req, res) => {
   }
 });
 
-/** ====== S3: presign & list (per-user) ====== */
+/* ========= S3: presign & list (per-user) ========= */
 
-// Presigned PUT (upload) — matches CLI SSE=AES256
+// Presigned PUT (upload)
 app.post('/api/files/presign/upload', authRequired, async (req, res) => {
   try {
     const { fileName, contentType } = req.body || {};
@@ -215,21 +224,17 @@ app.get('/api/files/presign/download', authRequired, async (req, res) => {
   }
 });
 
-/** ====== S3: bucket or per-user STATS ======
+/* ========= S3: bucket or per-user STATS =========
  * GET /files/stats?scope=all|me
- *  - scope=me (default) -> per-user prefix (requires Authorization)
- *  - scope=all -> whole bucket (admin-ish; no auth enforced here, add if needed)
  */
 app.get('/files/stats', async (req, res) => {
   try {
     const scope = String(req.query.scope || 'me');
     let prefix;
 
-    // If scope=me, try to read Authorization and compute per-user prefix
     if (scope === 'all') {
       prefix = undefined; // whole bucket
     } else {
-      // Extract user from token if present
       const hdr = req.headers['authorization'];
       if (!hdr?.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing bearer token' });
       try {
@@ -265,9 +270,9 @@ app.get('/files/stats', async (req, res) => {
   }
 });
 
-/** ====== START ====== */
-app.listen(PORT, () => {
-  console.log(`✅ API http://localhost:${PORT}`);
+/* ========= START ========= */
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ API http://0.0.0.0:${PORT}`);
   console.log(`🪣 S3: s3://${BUCKET_NAME} (${S3_REGION}) acct ${ACCOUNT_ID}`);
-  console.log(`🔓 CORS: ${CORS_ORIGINS.join(', ')}`);
+  console.log(`🔓 CORS: ${[...ALLOW_SET].join(', ')}`);
 });
