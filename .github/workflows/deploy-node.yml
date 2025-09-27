@@ -23,10 +23,9 @@ jobs:
           node-version: 20
           cache: npm
 
-      - name: Install & build
+      - name: Install & Build
         run: |
           npm ci
-          # build only if you have a build step (TS/Next/etc.)
           if npm pkg get scripts.build | grep -qv 'undefined'; then
             npm run build
           fi
@@ -40,7 +39,7 @@ jobs:
             --exclude='*.log' \
             .
 
-      # Upload bundle to EC2
+      # Upload app bundle to EC2
       - name: Upload to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -50,8 +49,8 @@ jobs:
           source: "app.tar.gz"
           target: "~/deploy/"
 
-      # SSH into EC2 and deploy
-      - name: Deploy & restart on EC2
+      # Deploy on EC2 + reload with PM2
+      - name: Deploy & Restart on EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: 3.87.108.144
@@ -65,40 +64,23 @@ jobs:
             BUNDLE="/home/ec2-user/deploy/app.tar.gz"
             RELEASE_DIR="$APP_DIR/release-$(date +%s)"
 
-            # prepare dirs
             mkdir -p "$APP_DIR/releases"
-            mkdir -p "$(dirname "$BUNDLE")"
-
-            # extract release
             rm -rf "$RELEASE_DIR"
             mkdir -p "$RELEASE_DIR"
-            tar -xzf "$BUNDLE" -C "$RELEASE_DIR"
 
-            # install Node if missing
-            if ! command -v node >/dev/null 2>&1; then
-              curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo -E bash -
-              sudo yum install -y nodejs
-            fi
-            if ! command -v pm2 >/dev/null 2>&1; then
-              sudo npm install -g pm2
-            fi
+            tar -xzf "$BUNDLE" -C "$RELEASE_DIR"
 
             cd "$RELEASE_DIR"
             npm ci --omit=dev
 
-            # symlink current
             ln -sfn "$RELEASE_DIR" "$APP_DIR/current"
 
-            # start/reload with PM2
-            if [ -f ecosystem.config.js ]; then
-              pm2 startOrReload ecosystem.config.js --only "$APP_NAME" || pm2 start ecosystem.config.js --only "$APP_NAME"
+            # Restart with PM2
+            if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
+              pm2 reload "$APP_NAME" --update-env
             else
-              if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
-                pm2 reload "$APP_NAME" --update-env
-              else
-                pm2 start dynamo.js --name "$APP_NAME"
-              fi
+              pm2 start dynamo.js --name "$APP_NAME"
             fi
 
+            # Ensure it survives reboot
             pm2 save
-            echo "✅ Deployment finished"
