@@ -4,6 +4,7 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
@@ -19,6 +20,9 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const DDB_TABLE = process.env.DDB_TABLE || 'Users'; // PK (S), SK (S)
 const USER_SK = process.env.USER_SK || 'USER';
+
+// NapierHashes table
+const NAPIER_TABLE = process.env.NAPIER_TABLE || 'NapierHashes';
 
 // S3 (your values)
 const ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || '342448511865';
@@ -127,12 +131,28 @@ app.post('/login', async (req, res) => {
 
 /** ====== S3: presign & list ====== */
 
-// presigned PUT (upload) — includes SSE AES256 to match your CLI
+// presigned PUT (upload) — with NapierHash check
 app.post('/api/files/presign/upload', authRequired, async (req, res) => {
   try {
-    const { fileName, contentType } = req.body || {};
-    if (!fileName) return res.status(400).json({ error: 'Missing fileName' });
+    const { fileName, contentType, sha256 } = req.body || {};
+    if (!fileName || !sha256) {
+      return res.status(400).json({ error: 'Missing fileName or sha256' });
+    }
 
+    // 1. Check NapierHashes table
+    const out = await ddb.send(new GetCommand({
+      TableName: NAPIER_TABLE,
+      Key: { sha256 }
+    }));
+
+    if (out.Item?.status === 'malicious') {
+      return res.status(403).json({
+        error: 'Upload rejected: file is known malicious.',
+        sha256
+      });
+    }
+
+    // 2. Presign as usual
     const safeName = sanitize(fileName);
     const key = `${userPrefix(req)}${Date.now()}_${safeName}`;
 
@@ -140,7 +160,8 @@ app.post('/api/files/presign/upload', authRequired, async (req, res) => {
       Bucket: BUCKET_NAME,
       Key: key,
       ContentType: contentType || 'application/octet-stream',
-      ServerSideEncryption: 'AES256', // <- important
+      ServerSideEncryption: 'AES256',
+      Metadata: { sha256 }
     });
 
     const uploadUrl = await getSignedUrl(s3, cmd, { expiresIn: 60 * 5 });

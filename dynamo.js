@@ -40,12 +40,15 @@ const SNS_TOPIC_ARN = process.env.SNS_TOPIC_ARN || '';
 const SQS_QUEUE_URL = process.env.SQS_QUEUE_URL || '';
 
 /* ========= CORS ========= */
-const RAW_ORIGINS = (process.env.CORS_ORIGINS && process.env.CORS_ORIGINS.split(',')) || [
-  'http://localhost:3000',
-  'https://d1e7o1ng62c5j.cloudfront.net',
-];
+const RAW_ORIGINS =
+  (process.env.CORS_ORIGINS && process.env.CORS_ORIGINS.split(',')) || [
+    'http://localhost:3000',
+    'https://d1e7o1ng62c5j.cloudfront.net',
+  ];
 const ALLOW_SET = new Set(
-  RAW_ORIGINS.map(s => (s || '').trim()).filter(Boolean).map(o => o.replace(/\/+$/, '').toLowerCase())
+  RAW_ORIGINS.map((s) => (s || '').trim())
+    .filter(Boolean)
+    .map((o) => o.replace(/\/+$/, '').toLowerCase())
 );
 
 /* ========= AWS CLIENTS ========= */
@@ -100,23 +103,50 @@ async function publishSNS(subject, message) {
 async function sendSQS(eventType, payload) {
   if (!sqs || !SQS_QUEUE_URL) return;
   try {
-    await sqs.send(new SendMessageCommand({
-      QueueUrl: SQS_QUEUE_URL,
-      MessageBody: JSON.stringify({ eventType, ...payload, ts: new Date().toISOString() }),
-      MessageAttributes: {
-        eventType: { DataType: 'String', StringValue: eventType },
-        ...(payload?.email ? { email: { DataType: 'String', StringValue: payload.email } } : {}),
-      },
-    }));
+    await sqs.send(
+      new SendMessageCommand({
+        QueueUrl: SQS_QUEUE_URL,
+        MessageBody: JSON.stringify({ eventType, ...payload, ts: new Date().toISOString() }),
+        MessageAttributes: {
+          eventType: { DataType: 'String', StringValue: eventType },
+          ...(payload?.email ? { email: { DataType: 'String', StringValue: payload.email } } : {}),
+        },
+      })
+    );
   } catch (e) {
     console.error('SQS send failed:', e);
   }
 }
 
+/* ========= BLOCKLIST (SHA-256) ========= */
+// Comma-separated hex hashes in env, plus hardcoded known-bad fallbacks
+const BLOCKED_HASHES = new Set(
+  [
+    ...(process.env.BLOCKED_HASHES || '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+    // Fallback: include the provided malicious hash
+    '4465c8fed5d0b21a2aa49dc65ac1b14b917c2d27065619657c67d3b6aeae0b00',
+  ].filter(Boolean)
+);
+
+// Basic hex validation + membership check
+function isBlockedSha256(hex) {
+  const h = String(hex || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(h)) return false; // only valid sha-256 hexdigests considered
+  return BLOCKED_HASHES.has(h);
+}
+
+const ipOf = (req) => req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
+
 /* ========= HEALTH ========= */
 app.get('/health', async (_req, res) => {
   try {
-    const s3Ok = await s3.send(new HeadBucketCommand({ Bucket: BUCKET_NAME })).then(() => true).catch(() => false);
+    const s3Ok = await s3
+      .send(new HeadBucketCommand({ Bucket: BUCKET_NAME }))
+      .then(() => true)
+      .catch(() => false);
     res.json({
       ok: true,
       bucket: BUCKET_NAME,
@@ -124,6 +154,7 @@ app.get('/health', async (_req, res) => {
       cognitoConfigured: !!(USER_POOL_ID && CLIENT_ID),
       snsConfigured: !!SNS_TOPIC_ARN,
       sqsConfigured: !!SQS_QUEUE_URL,
+      blockedHashesCount: BLOCKED_HASHES.size,
     });
   } catch (e) {
     res.json({ ok: false, error: String(e?.message || e) });
@@ -139,12 +170,17 @@ app.post('/signup', async (req, res) => {
     const password = req.body?.password || '';
     if (!name || !email || !password) return res.status(400).json({ error: 'Missing name/email/password' });
 
-    await cognito.send(new SignUpCommand({
-      ClientId: CLIENT_ID,
-      Username: email,
-      Password: password,
-      UserAttributes: [{ Name: 'email', Value: email }, { Name: 'name', Value: name }],
-    }));
+    await cognito.send(
+      new SignUpCommand({
+        ClientId: CLIENT_ID,
+        Username: email,
+        Password: password,
+        UserAttributes: [
+          { Name: 'email', Value: email },
+          { Name: 'name', Value: name },
+        ],
+      })
+    );
 
     await publishSNS('Signup initiated', `New signup for ${email}`);
     res.json({ message: 'Signup initiated. Check your email for a confirmation code.', requiresConfirmation: true });
@@ -165,10 +201,12 @@ app.post('/resend-confirmation', async (req, res) => {
     const email = (req.body?.email || '').toLowerCase().trim();
     if (!email) return res.status(400).json({ error: 'Missing email' });
 
-    await cognito.send(new ResendConfirmationCodeCommand({
-      ClientId: CLIENT_ID,
-      Username: email,
-    }));
+    await cognito.send(
+      new ResendConfirmationCodeCommand({
+        ClientId: CLIENT_ID,
+        Username: email,
+      })
+    );
     res.json({ message: 'Confirmation code resent' });
   } catch (err) {
     console.error('Resend confirmation error:', err);
@@ -183,19 +221,23 @@ app.post('/confirm-signup', async (req, res) => {
     const password = (req.body?.password || '').trim();
     if (!email || !code || !password) return res.status(400).json({ error: 'Missing email/code/password' });
 
-    await cognito.send(new ConfirmSignUpCommand({
-      ClientId: CLIENT_ID,
-      Username: email,
-      ConfirmationCode: code,
-    }));
+    await cognito.send(
+      new ConfirmSignUpCommand({
+        ClientId: CLIENT_ID,
+        Username: email,
+        ConfirmationCode: code,
+      })
+    );
 
     await publishSNS('Email confirmed', `Email confirmed for ${email}`);
 
-    const init = await cognito.send(new InitiateAuthCommand({
-      AuthFlow: 'USER_PASSWORD_AUTH',
-      ClientId: CLIENT_ID,
-      AuthParameters: { USERNAME: email, PASSWORD: password },
-    }));
+    const init = await cognito.send(
+      new InitiateAuthCommand({
+        AuthFlow: 'USER_PASSWORD_AUTH',
+        ClientId: CLIENT_ID,
+        AuthParameters: { USERNAME: email, PASSWORD: password },
+      })
+    );
 
     if (init.ChallengeName === 'MFA_SETUP') {
       return res.json({ challengeName: 'MFA_SETUP', session: init.Session, message: 'MFA setup required' });
@@ -234,19 +276,23 @@ app.post('/mfa/setup/verify', async (req, res) => {
     const { email, code, session } = req.body || {};
     if (!email || !code || !session) return res.status(400).json({ error: 'Missing email/code/session' });
 
-    const verify = await cognito.send(new VerifySoftwareTokenCommand({
-      Session: session,
-      UserCode: code,
-      FriendlyDeviceName: 'Authenticator',
-    }));
+    const verify = await cognito.send(
+      new VerifySoftwareTokenCommand({
+        Session: session,
+        UserCode: code,
+        FriendlyDeviceName: 'Authenticator',
+      })
+    );
     if (verify.Status !== 'SUCCESS') return res.status(401).json({ error: 'TOTP verify failed' });
 
-    const resp = await cognito.send(new RespondToAuthChallengeCommand({
-      ClientId: CLIENT_ID,
-      ChallengeName: 'MFA_SETUP',
-      Session: session,
-      ChallengeResponses: { USERNAME: email },
-    }));
+    const resp = await cognito.send(
+      new RespondToAuthChallengeCommand({
+        ClientId: CLIENT_ID,
+        ChallengeName: 'MFA_SETUP',
+        Session: session,
+        ChallengeResponses: { USERNAME: email },
+      })
+    );
 
     await publishSNS('MFA setup completed', `MFA TOTP enrolled for ${email}`);
 
@@ -259,7 +305,7 @@ app.post('/mfa/setup/verify', async (req, res) => {
     if (err?.name === 'NotAuthorizedException') {
       return res.status(401).json({
         error: 'Thank you, please login again.',
-        redirect: true
+        redirect: true,
       });
     }
     res.status(401).json({ error: 'MFA setup failed' });
@@ -272,11 +318,13 @@ app.post('/login', async (req, res) => {
     const password = req.body?.password || '';
     if (!email || !password) return res.status(400).json({ error: 'Missing email/password' });
 
-    const init = await cognito.send(new InitiateAuthCommand({
-      AuthFlow: 'USER_PASSWORD_AUTH',
-      ClientId: CLIENT_ID,
-      AuthParameters: { USERNAME: email, PASSWORD: password },
-    }));
+    const init = await cognito.send(
+      new InitiateAuthCommand({
+        AuthFlow: 'USER_PASSWORD_AUTH',
+        ClientId: CLIENT_ID,
+        AuthParameters: { USERNAME: email, PASSWORD: password },
+      })
+    );
 
     if (init.ChallengeName === 'SOFTWARE_TOKEN_MFA' || init.ChallengeName === 'SMS_MFA') {
       return res.json({ challengeName: init.ChallengeName, session: init.Session, message: 'MFA required' });
@@ -307,16 +355,18 @@ app.post('/login/mfa', async (req, res) => {
       return res.status(400).json({ error: 'Missing email/code/session/challengeName' });
     }
 
-    const resp = await cognito.send(new RespondToAuthChallengeCommand({
-      ClientId: CLIENT_ID,
-      ChallengeName: challengeName,
-      Session: session,
-      ChallengeResponses: {
-        USERNAME: email,
-        SMS_MFA_CODE: code,
-        SOFTWARE_TOKEN_MFA_CODE: code,
-      },
-    }));
+    const resp = await cognito.send(
+      new RespondToAuthChallengeCommand({
+        ClientId: CLIENT_ID,
+        ChallengeName: challengeName,
+        Session: session,
+        ChallengeResponses: {
+          USERNAME: email,
+          SMS_MFA_CODE: code,
+          SOFTWARE_TOKEN_MFA_CODE: code,
+        },
+      })
+    );
 
     if (!resp?.AuthenticationResult?.AccessToken) {
       return res.status(401).json({ error: 'MFA failed' });
@@ -333,12 +383,30 @@ app.post('/login/mfa', async (req, res) => {
 
 /* ========= S3 + SQS ========= */
 
-const ipOf = (req) => req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
-
+// Presign upload with SHA-256 blocklist gate
 app.post('/files/presign/upload', authRequired, async (req, res) => {
   try {
-    const { fileName, contentType, size } = req.body || {};
+    const { fileName, contentType, size, sha256 } = req.body || {};
+
     if (!fileName) return res.status(400).json({ error: 'Missing fileName' });
+    if (!sha256) return res.status(400).json({ error: 'Missing sha256' });
+
+    // Gate on SHA-256
+    if (isBlockedSha256(sha256)) {
+      await sendSQS('upload_blocked_hash', {
+        email: req.user?.email,
+        reason: 'blocked_hash',
+        sha256,
+        ip: ipOf(req),
+        fileName: String(fileName || ''),
+        size: Number(size) || 0,
+      });
+      return res.status(403).json({
+        error: 'Malicious file blocked',
+        code: 'BLOCKED_HASH',
+        sha256,
+      });
+    }
 
     const safeName = sanitize(fileName);
     const key = `${userPrefix(req)}${Date.now()}_${safeName}`;
@@ -357,6 +425,7 @@ app.post('/files/presign/upload', authRequired, async (req, res) => {
       key,
       contentType: contentType || 'application/octet-stream',
       size: Number(size) || 0,
+      sha256,
       ip: ipOf(req),
     });
 
@@ -367,17 +436,39 @@ app.post('/files/presign/upload', authRequired, async (req, res) => {
   }
 });
 
+// Notify upload (defense-in-depth: also reject if reported hash is blocked)
 app.post('/files/notify-upload', authRequired, async (req, res) => {
   try {
     const key = String(req.body?.key || '');
     const size = Number(req.body?.size || 0);
+    const sha256 = String(req.body?.sha256 || '').toLowerCase();
+
     if (!key) return res.status(400).json({ error: 'Missing key' });
     if (!key.startsWith(userPrefix(req))) return res.status(403).json({ error: 'Forbidden key' });
+
+    if (isBlockedSha256(sha256)) {
+      try {
+        await s3.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+      } catch (e) {
+        console.error('Delete after blocked hash failed:', e);
+      }
+
+      await sendSQS('upload_blocked_hash_post', {
+        email: req.user?.email,
+        key,
+        size,
+        sha256,
+        ip: ipOf(req),
+      });
+
+      return res.status(403).json({ error: 'Malicious file removed', code: 'BLOCKED_HASH', sha256 });
+    }
 
     await sendSQS('upload_completed', {
       email: req.user?.email,
       key,
       size,
+      sha256,
       ip: ipOf(req),
     });
 
@@ -394,13 +485,15 @@ app.get('/files/list', authRequired, async (req, res) => {
     let ContinuationToken;
     const all = [];
     do {
-      const out = await s3.send(new ListObjectsV2Command({
-        Bucket: BUCKET_NAME,
-        Prefix,
-        ContinuationToken,
-        MaxKeys: 1000,
-      }));
-      (out.Contents || []).forEach(o =>
+      const out = await s3.send(
+        new ListObjectsV2Command({
+          Bucket: BUCKET_NAME,
+          Prefix,
+          ContinuationToken,
+          MaxKeys: 1000,
+        })
+      );
+      (out.Contents || []).forEach((o) =>
         all.push({ key: o.Key, size: o.Size, lastModified: o.LastModified })
       );
       ContinuationToken = out.IsTruncated ? out.NextContinuationToken : undefined;
@@ -419,7 +512,11 @@ app.get('/files/presign/view', authRequired, async (req, res) => {
     if (!key) return res.status(400).json({ error: 'Missing key' });
     if (!key.startsWith(userPrefix(req))) return res.status(403).json({ error: 'Forbidden key' });
 
-    const cmd = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key, ResponseContentDisposition: 'inline' });
+    const cmd = new GetObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: key,
+      ResponseContentDisposition: 'inline',
+    });
     const url = await getSignedUrl(s3, cmd, { expiresIn: 60 * 5 });
     res.json({ url });
   } catch (err) {
@@ -434,7 +531,11 @@ app.get('/files/presign/download', authRequired, async (req, res) => {
     if (!key) return res.status(400).json({ error: 'Missing key' });
     if (!key.startsWith(userPrefix(req))) return res.status(403).json({ error: 'Forbidden key' });
 
-    const cmd = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key, ResponseContentDisposition: 'attachment' });
+    const cmd = new GetObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: key,
+      ResponseContentDisposition: 'attachment',
+    });
     const url = await getSignedUrl(s3, cmd, { expiresIn: 60 * 5 });
     res.json({ url });
   } catch (err) {
@@ -443,7 +544,7 @@ app.get('/files/presign/download', authRequired, async (req, res) => {
   }
 });
 
-// NEW: Delete object (scoped to user's prefix)
+// Delete object (scoped to user's prefix)
 app.delete('/files/delete', authRequired, async (req, res) => {
   try {
     const key = String(req.query.key || '');
@@ -472,5 +573,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🔐 Cognito enforced (email OTP + MFA)`);
   console.log(`🪣 S3: s3://${BUCKET_NAME} (${S3_REGION})`);
   console.log(`📣 SNS: ${sns ? 'enabled' : 'disabled'} | 📨 SQS: ${sqs ? 'enabled' : 'disabled'}`);
+  console.log(`🧱 Blocked hashes: ${BLOCKED_HASHES.size}`);
   console.log(`🔓 CORS: ${[...ALLOW_SET].join(', ')}`);
 });
